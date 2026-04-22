@@ -37,6 +37,27 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # ── XSA (eXclusive Self-Attention) ──────────────────────────────────────
+    # Removes the self-value bias from attention output via orthogonal projection.
+    # Core formula:  z = y − α · (y·v / ‖v‖²) · v
+    #
+    # xsa_mode selects the attention variant for research runs:
+    #   "sa"       – Standard Attention: α=0 everywhere (baseline, no overhead)
+    #   "xsa"      – Static XSA: fixed α=xsa_alpha for selected layers (original paper)
+    #   "adaptive" – Adaptive XSA: learned α per attention head (nn.Parameter, shape n_head),
+    #                initialized to xsa_alpha; allows the model to discover optimal strength per head
+    #   "gated"    – Gated XSA: input-conditioned α via sigmoid(Linear(x)) per position & head,
+    #                the most expressive variant – the model learns when/how much to suppress
+    xsa_mode: str = "sa"
+    # α for "sa" and "adaptive" modes. For "sa": the static scalar. For "adaptive": init value.
+    xsa_alpha: float = 1.0
+    # Which layers receive XSA (ignored when xsa_mode="sa"). Options:
+    #   "all"   – every layer
+    #   "deep"  – last half of layers (strongest recency / position bias)
+    #   "N,..." – explicit comma-separated zero-based indices, e.g. "6,7,8,9,10,11"
+    xsa_layer_mode: str = "all"
+    # Disable Value Embeddings on XSA-active layers to isolate XSA's effect from VE interaction.
+    xsa_disable_ve: bool = False
 
 
 def norm(x):
@@ -53,6 +74,23 @@ class Linear(nn.Linear):
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def get_xsa_layers(xsa_layer_mode: str, n_layer: int) -> set:
+    """Return the set of layer indices where XSA is applied.
+
+    Modes:
+      "all"  – all layers
+      "deep" – last half of layers (indices [n_layer//2, n_layer))
+      "N,..." – explicit comma-separated layer indices
+    """
+    mode = xsa_layer_mode.strip()
+    if mode == "all":
+        return set(range(n_layer))
+    elif mode == "deep":
+        return set(range(n_layer // 2, n_layer))
+    else:
+        return {int(i.strip()) for i in mode.split(",")}
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
@@ -78,6 +116,26 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+
+        # ── XSA mode setup ──────────────────────────────────────────────────
+        # Determine if this layer participates in XSA at all.
+        xsa_active_layers = get_xsa_layers(config.xsa_layer_mode, config.n_layer)
+        self.xsa_mode = config.xsa_mode if (config.xsa_mode != "sa" and layer_idx in xsa_active_layers) else "sa"
+        if self.xsa_mode == "xsa":
+            # Static scalar α; stored as plain float (no parameter, no overhead).
+            self.xsa_alpha_val = float(config.xsa_alpha)
+        elif self.xsa_mode == "adaptive":
+            # One learnable scalar per attention head.  The model discovers optimal
+            # projection strength independently per head.  Init from config.xsa_alpha
+            # so a run started at 1.0 begins as full XSA and can relax.
+            # Shape (n_head,) – placed in its own AdamW group in setup_optimizer.
+            self.xsa_alphas = nn.Parameter(torch.empty(self.n_head))
+        elif self.xsa_mode == "gated":
+            # Per-position, per-head sigmoid gate conditioned on the normed input.
+            # Produces α ∈ (0,1) at every (position, head), giving the model full
+            # control over when and how much to suppress the self-value contribution.
+            # Weight shape (n_head, n_embd) → goes into Muon matrix group naturally.
+            self.xsa_gate = Linear(self.n_embd, self.n_head, bias=False)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -119,6 +177,35 @@ class CausalSelfAttention(nn.Module):
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
+
+        # ── XSA projection (all non-"sa" modes) ────────────────────────────
+        # Core formula:  z = y − α · (y·v / ‖v‖²) · v
+        # This removes the component of the attention output that lies along the
+        # position's own value vector, breaking the self-attention shortcut bias.
+        # α shape varies by mode; broadcasting handles (B, T, n_head, head_dim).
+        if self.xsa_mode != "sa":
+            # Expand v from n_kv_head → n_head to handle GQA
+            groups = self.n_head // self.n_kv_head
+            v_exp = v.repeat_interleave(groups, dim=2)               # (B, T, n_head, D)
+            v_norm_sq = (v_exp * v_exp).sum(-1, keepdim=True).clamp(min=1e-12)
+            proj = (y * v_exp).sum(-1, keepdim=True) / v_norm_sq * v_exp  # component of y along v
+
+            if self.xsa_mode == "xsa":
+                # Static α: scalar float, broadcasts over all dims.
+                y = y - self.xsa_alpha_val * proj
+
+            elif self.xsa_mode == "adaptive":
+                # Learned α per head; clamped to [0, 2] to keep training stable
+                # (allows over-projection beyond full orthogonality for research).
+                alpha = self.xsa_alphas.clamp(0.0, 2.0)             # (n_head,)
+                y = y - alpha[None, None, :, None] * proj
+
+            elif self.xsa_mode == "gated":
+                # Input-conditioned α: the gate learns WHEN and HOW MUCH to suppress.
+                # x is already normed (passed from Block as norm(residual)).
+                # sigmoid(Linear(x)) → (B, T, n_head) in (0, 1)
+                alpha = torch.sigmoid(self.xsa_gate(x))             # (B, T, n_head)
+                y = y - alpha.unsqueeze(-1) * proj
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
@@ -163,6 +250,8 @@ class GPT(nn.Module):
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
+        # XSA: track which layers have XSA active (used to gate value embeddings when xsa_disable_ve=True)
+        self.xsa_layers = get_xsa_layers(config.xsa_layer_mode, config.n_layer) if config.xsa_mode != "sa" else set()
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -251,6 +340,17 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # XSA-specific parameter init
+        for block in self.transformer.h:
+            attn = block.attn
+            if attn.xsa_mode == "adaptive":
+                # Init each head's alpha to xsa_alpha so training starts at the configured point.
+                torch.nn.init.constant_(attn.xsa_alphas, self.config.xsa_alpha)
+            elif attn.xsa_mode == "gated":
+                # Init gate weights near zero so sigmoid(~0) ≈ 0.5 at the start (moderate XSA).
+                # Small uniform, same scale as smear_gate, keeps early training stable.
+                torch.nn.init.uniform_(attn.xsa_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -375,15 +475,30 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
+        # ── Collect XSA adaptive alphas (nn.Parameter scalars, shape n_head) ──
+        # These are per-head scalar parameters used only in "adaptive" mode.
+        # They must be separated from matrix_params before building Muon groups
+        # because Muon is designed for 2-D weight matrices, not 1-D scalars.
+        xsa_alpha_params = [
+            block.attn.xsa_alphas
+            for block in self.transformer.h
+            if block.attn.xsa_mode == "adaptive"
+        ]
+        xsa_alpha_param_ids = {id(p) for p in xsa_alpha_params}
+
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # matrix_params: everything in transformer blocks EXCEPT adaptive XSA scalars
+        matrix_params = [p for p in self.transformer.h.parameters() if id(p) not in xsa_alpha_param_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        all_param_count = (len(matrix_params) + len(embedding_params) + len(lm_head_params)
+                           + len(value_embeds_params) + len(resid_params) + len(x0_params)
+                           + len(smear_params) + len(xsa_alpha_params))
+        assert len(list(self.parameters())) == all_param_count
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -399,6 +514,13 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # Adaptive XSA per-head alphas: slow AdamW (low LR, no weight decay).
+        # Kept separate from Muon because these are 1-D scalars, not weight matrices.
+        if xsa_alpha_params:
+            param_groups.append(dict(
+                kind='adamw', params=xsa_alpha_params,
+                lr=scalar_lr * 0.05, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0,
+            ))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -455,7 +577,10 @@ class GPT(nn.Module):
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            # Skip value embeddings when xsa_disable_ve=True and this layer has XSA active,
+            # allowing isolation of XSA's effect without the VE interaction.
+            use_ve = not (self.config.xsa_disable_ve and i in self.xsa_layers)
+            ve = self.value_embeds[str(i)](idx).to(x.dtype) if (str(i) in self.value_embeds and use_ve) else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
@@ -473,8 +598,8 @@ class GPT(nn.Module):
 
         if targets is not None:
             # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # Use reshape (not view) to handle non-contiguous inputs from sliced batches
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
             # inference: just return the logits directly
